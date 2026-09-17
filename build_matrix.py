@@ -8,6 +8,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ SHIPMENT_HEADERS = [
     "Origin Postal Code",
     "Destination Country",
     "Destination Postal Code",
+    "Company",
 ]
 
 TOLL_BLOCK = {
@@ -65,6 +67,17 @@ RETURN_BLOCK = {
     "apply_if": "",
     "rate_by": "Rate by: Weight/kg",
 }
+
+SONDER_BLOCK = {
+    "title": "Transport cost (Ecolab Sondervereinbarungen)",
+    "apply_if": "",
+    "rate_by": "Rate by: Per shipment",
+}
+
+SONDER_COMPANY = "Ecolab Sondervereinbarungen"
+REGULAR_COMPANY = "not Ecolab Sondervereinbarungen"
+SONDER_POSTAL = "64"
+SONDER_SOURCE_KEY = "fracht"
 
 
 @dataclass
@@ -118,9 +131,19 @@ def rate_value(value: Any) -> float | None:
     if not text or text.lower() == "on request":
         return None
     try:
-        return float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
+        return float(Decimal(str(value).replace(",", ".")))
+    except (TypeError, ValueError, InvalidOperation, ArithmeticError):
         return None
+
+
+def excel_number_format(value: float) -> str:
+    """Keep source digits so 0.205 is written as 0.205, not rounded to 0.21."""
+    decimal_value = Decimal(str(value)).normalize()
+    exponent = decimal_value.as_tuple().exponent
+    if not isinstance(exponent, int) or exponent >= 0:
+        return "0"
+    decimal_places = min(-exponent, 15)
+    return "0." + ("0" * decimal_places)
 
 
 def normalize_postal(value: Any) -> str | None:
@@ -177,6 +200,8 @@ def classify_tab(combined_tab: str) -> str:
         return "groupage"
     if "transfer" in lowered:
         return "transfer"
+    if "sondervere" in lowered:
+        return "sondervereinbarungen"
     return "other"
 
 
@@ -341,18 +366,17 @@ def find_numeric_brackets(header_row: pd.Series) -> list[BracketColumn]:
     brackets: list[BracketColumn] = []
     for offset, (column_index, upper_bound) in enumerate(numeric_columns):
         if offset == last_index:
-            upper_label = numeric_bracket_label(upper_bound)
+            brackets.append(
+                BracketColumn(
+                    source_key=f"col_{column_index}",
+                    bracket_label=numeric_bracket_label(upper_bound),
+                    column_index=column_index,
+                )
+            )
             over_label = (
                 f">{int(upper_bound)}"
                 if upper_bound == int(upper_bound)
                 else f">{upper_bound}"
-            )
-            brackets.append(
-                BracketColumn(
-                    source_key=f"col_{column_index}",
-                    bracket_label=upper_label,
-                    column_index=column_index,
-                )
             )
             brackets.append(
                 BracketColumn(
@@ -422,12 +446,72 @@ def parse_rate_sheet(
     )
 
 
+def find_fracht_value(raw: pd.DataFrame) -> float | None:
+    for row_index in range(len(raw)):
+        for col_index in range(len(raw.columns)):
+            label = cell_text(raw.iloc[row_index, col_index]).rstrip(":").strip()
+            if label.lower() != "fracht":
+                continue
+            for value_index in range(col_index + 1, len(raw.columns)):
+                price = rate_value(raw.iloc[row_index, value_index])
+                if price is not None:
+                    return price
+    return None
+
+
+def parse_sondervereinbarungen(excel_file: pd.ExcelFile) -> tuple[str, float] | None:
+    for combined_tab in excel_file.sheet_names:
+        if classify_tab(combined_tab) != "sondervereinbarungen":
+            continue
+        raw = pd.read_excel(excel_file, sheet_name=combined_tab, header=None)
+        fracht = find_fracht_value(raw)
+        if fracht is None:
+            print(f"  Skipping '{combined_tab}': no Fracht value found.")
+            continue
+        return combined_tab, fracht
+    return None
+
+
+def sonder_column_spec() -> CostColumnSpec:
+    return CostColumnSpec("", "Flat", SONDER_SOURCE_KEY)
+
+
+def make_sonder_cost_block() -> CostBlock:
+    return CostBlock(**SONDER_BLOCK, columns=[sonder_column_spec()])
+
+
+def build_sonder_matrix_row(fracht: float) -> MatrixRow:
+    spec = sonder_column_spec()
+    row = MatrixRow(
+        shipment={
+            "Origin Country": "",
+            "Origin Postal Code": "",
+            "Destination Country": "DE",
+            "Destination Postal Code": SONDER_POSTAL,
+            "Company": SONDER_COMPANY,
+        }
+    )
+    row.costs[cost_key(CostBlock(**SONDER_BLOCK, columns=[spec]), spec)] = fracht
+    return row
+
+
+def is_open_ended_bracket(bracket: BracketColumn) -> bool:
+    return bracket.source_key.endswith("_gt")
+
+
+def brackets_for_block(block_meta: dict[str, str], sheet: ParsedRateSheet) -> list[BracketColumn]:
+    brackets = sheet.brackets
+    if block_meta is GROUPAGE_BLOCK or block_meta is RETURN_BLOCK:
+        return [bracket for bracket in brackets if not is_open_ended_bracket(bracket)]
+    return brackets
+
+
 def make_cost_block(block_meta: dict[str, str], sheet: ParsedRateSheet | None) -> CostBlock | None:
     if sheet is None:
         return None
     columns = [
         CostColumnSpec(bracket.bracket_label, "Flat", bracket.source_key)
-        for bracket in sheet.brackets
+        for bracket in brackets_for_block(block_meta, sheet)
     ]
     return CostBlock(**block_meta, columns=columns)
 
@@ -439,9 +523,9 @@ def build_cost_blocks(
 ) -> list[CostBlock]:
     blocks: list[CostBlock] = []
     for block_meta, role in (
-        (TOLL_BLOCK, "maut"),
-        (GROUPAGE_BLOCK, "groupage"),
         (TRANSFER_BLOCK, "transfer"),
+        (GROUPAGE_BLOCK, "groupage"),
+        (TOLL_BLOCK, "maut"),
     ):
         block = make_cost_block(block_meta, parsed_sheets.get(role))
         if block is not None:
@@ -494,6 +578,7 @@ def build_matrix_rows(
             "Origin Postal Code": "",
             "Destination Country": destination_country,
             "Destination Postal Code": postal,
+            "Company": REGULAR_COMPANY if postal == SONDER_POSTAL else "",
         }
         row = MatrixRow(shipment=shipment)
 
@@ -502,14 +587,14 @@ def build_matrix_rows(
                 return
             rates = sheet.rates_by_postal.get(postal, {})
             block = CostBlock(**block_meta, columns=[])
-            for bracket in sheet.brackets:
+            for bracket in brackets_for_block(block_meta, sheet):
                 spec = CostColumnSpec(bracket.bracket_label, "Flat", bracket.source_key)
                 block.columns.append(spec)
                 row.costs[cost_key(block, spec)] = rates.get(bracket.source_key)
 
-        fill_block(TOLL_BLOCK, maut)
-        fill_block(GROUPAGE_BLOCK, groupage)
         fill_block(TRANSFER_BLOCK, transfer)
+        fill_block(GROUPAGE_BLOCK, groupage)
+        fill_block(TOLL_BLOCK, maut)
         fill_block(RETURN_BLOCK, return_sheet or groupage)
         matrix_rows.append(row)
 
@@ -579,10 +664,11 @@ def write_rates_sheet(
         currency_cell.fill = HEADER_FILL
         for spec_offset, spec in enumerate(block.columns):
             spec_col = column_index + 1 + spec_offset
-            bracket_cell = worksheet.cell(row=BRACKET_ROW, column=spec_col, value=spec.bracket_label)
-            bracket_cell.font = BOLD
-            bracket_cell.fill = HEADER_FILL
-            bracket_cell.alignment = CENTER
+            if spec.bracket_label:
+                bracket_cell = worksheet.cell(row=BRACKET_ROW, column=spec_col, value=spec.bracket_label)
+                bracket_cell.font = BOLD
+                bracket_cell.fill = HEADER_FILL
+                bracket_cell.alignment = CENTER
             unit_cell = worksheet.cell(row=COLUMN_HEADER_ROW, column=spec_col, value=spec.rate_unit)
             unit_cell.font = BOLD
             unit_cell.fill = HEADER_FILL
@@ -604,10 +690,10 @@ def write_rates_sheet(
                 value = matrix_row.costs.get(cost_key(block, spec))
                 if has_cost(value):
                     value_cell = worksheet.cell(row=excel_row, column=spec_col, value=value)
-                    value_cell.number_format = "0.00"
+                    value_cell.number_format = excel_number_format(value)
                 elif block_has_costs:
                     value_cell = worksheet.cell(row=excel_row, column=spec_col, value=0)
-                    value_cell.number_format = "0.00"
+                    value_cell.number_format = excel_number_format(0)
             column_index += block_column_width(block)
 
     for col_idx in range(1, worksheet.max_column + 1):
@@ -628,7 +714,7 @@ def write_accessorial_sheet(
     for row_index, row in enumerate(accessorial_rows, start=2):
         worksheet.cell(row=row_index, column=1, value=row.cost_name)
         price_cell = worksheet.cell(row=row_index, column=2, value=row.cost_price)
-        price_cell.number_format = "0.00"
+        price_cell.number_format = excel_number_format(row.cost_price)
         worksheet.cell(row=row_index, column=3, value=row.rate_by)
         worksheet.cell(row=row_index, column=4, value=row.apply_if)
 
@@ -678,6 +764,11 @@ def build_matrix_from_workbook(
             f"({len(parsed.rates_by_postal)} postal rows, {len(parsed.brackets)} brackets)"
         )
 
+    sonder = parse_sondervereinbarungen(excel_file)
+    if sonder is not None:
+        sonder_tab, fracht = sonder
+        print(f"  sondervereinbarungen: {sonder_tab} (Fracht={fracht}, lane DE {SONDER_POSTAL})")
+
     if "groupage" not in parsed_by_role:
         raise ValueError("Combined workbook must include an Ecolab BI Groupage tab.")
 
@@ -703,8 +794,13 @@ def build_matrix_from_workbook(
 
     target_path = output_path or matrix_output_path(destination_country)
     cost_blocks = build_cost_blocks(parsed_by_role, return_sheet=return_sheet)
+    if sonder is not None:
+        matrix_rows.append(build_sonder_matrix_row(sonder[1]))
+        cost_blocks.append(make_sonder_cost_block())
 
     used_tabs = get_used_matrix_tabs(parsed_by_role, return_tab)
+    if sonder is not None:
+        used_tabs.add(sonder[0])
     print("\nCollecting accessorial costs from unused tabs:")
     accessorial_rows = collect_accessorial_costs(excel_file, used_tabs)
 
