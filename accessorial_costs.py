@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import pandas as pd
@@ -91,8 +92,8 @@ def parse_price(value: Any) -> float | None:
     if not text or text.lower() == "on request":
         return None
     try:
-        return float(str(value).replace(",", "."))
-    except (TypeError, ValueError):
+        return float(Decimal(str(value).replace(",", ".")))
+    except (TypeError, ValueError, InvalidOperation, ArithmeticError):
         return None
 
 
